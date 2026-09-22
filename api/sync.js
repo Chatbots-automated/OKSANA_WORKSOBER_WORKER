@@ -31,12 +31,17 @@ export default async function handler(req, res) {
       timeout: 30000,
     });
 
+    // Correct selectors based on the actual IPS login HTML
     const emailInput = page
-      .locator('input[type="email"], input[name="email"]')
+      .locator('input[autocomplete="email"]')
       .first();
 
     const passwordInput = page
-      .locator('input[type="password"], input[name="password"]')
+      .locator('input[autocomplete="current-password"]')
+      .first();
+
+    const submitButton = page
+      .locator('button[type="submit"]')
       .first();
 
     await emailInput.waitFor({
@@ -49,17 +54,16 @@ export default async function handler(req, res) {
       timeout: 15000,
     });
 
+    console.log("Filling login credentials");
+
     await emailInput.fill(process.env.IPS_EMAIL);
     await passwordInput.fill(process.env.IPS_PASSWORD);
 
     console.log("Submitting login");
 
-    const submitButton = page
-      .locator('button[type="submit"]')
-      .first();
-
     await submitButton.click();
 
+    // Wait for login flow to complete
     try {
       await page.waitForURL(
         (url) =>
@@ -70,17 +74,13 @@ export default async function handler(req, res) {
         }
       );
     } catch {
-      console.log("URL wait timed out, continuing");
+      console.log("URL wait timed out, continuing...");
     }
 
-    console.log("Current URL after login:", page.url());
+    console.log("URL after login:", page.url());
 
-    /*
-      Open portal directly.
-
-      Even if the login service redirects through intermediate pages,
-      this gives the session a chance to initialize.
-    */
+    // Open the actual IPS measurements page
+    console.log("Opening IPS events page");
 
     await page.goto(
       "https://portal.ips.lt/lt/events/general",
@@ -90,18 +90,9 @@ export default async function handler(req, res) {
       }
     );
 
-    console.log("Portal opened:", page.url());
+    console.log("Events page URL:", page.url());
 
-    /*
-      Inspect cookies.
-
-      Earlier IPS requests showed:
-      - accessToken
-      - refreshToken
-
-      We mainly need accessToken for X-Authorization.
-    */
-
+    // Get cookies
     const cookies = await context.cookies();
 
     const accessTokenCookie = cookies.find(
@@ -113,33 +104,37 @@ export default async function handler(req, res) {
     );
 
     console.log(
-      "Access token:",
+      "Access token cookie:",
       accessTokenCookie ? "FOUND" : "NOT FOUND"
     );
 
     console.log(
-      "Refresh token:",
+      "Refresh token cookie:",
       refreshTokenCookie ? "FOUND" : "NOT FOUND"
     );
 
-    /*
-      Sometimes apps put auth in localStorage instead of cookies.
+    // Also inspect localStorage in case IPS stores auth there
+    let browserStorage = {};
 
-      Check there too.
-    */
+    try {
+      browserStorage = await page.evaluate(() => {
+        const data = {};
 
-    const browserStorage = await page.evaluate(() => {
-      const data = {};
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
 
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        data[key] = localStorage.getItem(key);
-      }
+          if (key) {
+            data[key] = localStorage.getItem(key);
+          }
+        }
 
-      return data;
-    });
+        return data;
+      });
+    } catch (error) {
+      console.log("Could not inspect localStorage:", error.message);
+    }
 
-    let accessToken =
+    const accessToken =
       accessTokenCookie?.value ||
       browserStorage.accessToken ||
       browserStorage.token ||
@@ -150,19 +145,15 @@ export default async function handler(req, res) {
       accessToken ? "FOUND" : "NOT FOUND"
     );
 
-    /*
-      Call IPS API.
-    */
-
-    const items = "500";
+    // Fetch measurements
+    const items = 500;
 
     const apiUrl =
       `https://portal.ips.lt/api/measurements/latest?items=${items}`;
 
     const headers = {
       Accept: "application/json, text/plain, */*",
-      Referer:
-        "https://portal.ips.lt/lt/events/general",
+      Referer: "https://portal.ips.lt/lt/events/general",
     };
 
     if (accessToken) {
@@ -188,11 +179,6 @@ export default async function handler(req, res) {
     if (!response.ok()) {
       const responseText = await response.text();
 
-      console.error(
-        "Measurements API failed:",
-        responseText
-      );
-
       return res.status(response.status()).json({
         ok: false,
         stage: "measurements",
@@ -201,16 +187,16 @@ export default async function handler(req, res) {
         refreshTokenFound: Boolean(
           refreshTokenCookie?.value
         ),
+        currentUrl: page.url(),
         error: responseText,
       });
     }
 
     const measurements = await response.json();
 
-    /*
-      Return only a preview so the Vercel response
-      doesn't become unnecessarily huge.
-    */
+    console.log(
+      `Received ${measurements.length} measurements`
+    );
 
     const preview = measurements
       .slice(0, 10)
@@ -228,10 +214,10 @@ export default async function handler(req, res) {
           item.employee?.employeeNumber ?? null,
 
         name:
-          item.employee?.name ?? null,
+          item.employee?.name?.trim() ?? null,
 
         surname:
-          item.employee?.surname ?? null,
+          item.employee?.surname?.trim() ?? null,
 
         deviceSerial:
           item.deviceSerial ?? null,
@@ -257,7 +243,6 @@ export default async function handler(req, res) {
     });
   } catch (error) {
     console.error("IPS sync error");
-
     console.error(error);
 
     return res.status(500).json({
@@ -271,7 +256,7 @@ export default async function handler(req, res) {
       try {
         await browser.close();
       } catch {
-        //
+        // ignore browser close errors
       }
     }
   }
