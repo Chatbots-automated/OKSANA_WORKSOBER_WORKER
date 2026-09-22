@@ -8,7 +8,8 @@ export default async function handler(req, res) {
     if (!process.env.IPS_EMAIL || !process.env.IPS_PASSWORD) {
       return res.status(500).json({
         ok: false,
-        error: "Missing IPS_EMAIL or IPS_PASSWORD environment variable",
+        stage: "env",
+        error: "Missing IPS_EMAIL or IPS_PASSWORD",
       });
     }
 
@@ -24,25 +25,24 @@ export default async function handler(req, res) {
 
     const page = await context.newPage();
 
-    console.log("Opening login page");
+    console.log("Opening login");
 
     await page.goto("https://login.ips.lt/lt", {
       waitUntil: "domcontentloaded",
       timeout: 30000,
     });
 
-    // Correct selectors based on the actual IPS login HTML
-    const emailInput = page
-      .locator('input[autocomplete="email"]')
-      .first();
+    const emailInput = page.locator(
+      'input[autocomplete="email"]'
+    );
 
-    const passwordInput = page
-      .locator('input[autocomplete="current-password"]')
-      .first();
+    const passwordInput = page.locator(
+      'input[autocomplete="current-password"]'
+    );
 
-    const submitButton = page
-      .locator('button[type="submit"]')
-      .first();
+    const submitButton = page.locator(
+      'button[type="submit"]'
+    );
 
     await emailInput.waitFor({
       state: "visible",
@@ -54,33 +54,116 @@ export default async function handler(req, res) {
       timeout: 15000,
     });
 
-    console.log("Filling login credentials");
+    console.log("Filling credentials");
 
     await emailInput.fill(process.env.IPS_EMAIL);
     await passwordInput.fill(process.env.IPS_PASSWORD);
 
     console.log("Submitting login");
 
+    /*
+      IMPORTANT:
+      Wait for the real login API request.
+    */
+
+    const loginResponsePromise = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/account/login") &&
+        response.request().method() === "POST",
+      {
+        timeout: 30000,
+      }
+    );
+
     await submitButton.click();
 
-    // Wait for login flow to complete
+    const loginResponse = await loginResponsePromise;
+
+    console.log(
+      "Login API status:",
+      loginResponse.status()
+    );
+
+    let loginBody = null;
+
+    try {
+      loginBody = await loginResponse.json();
+    } catch {
+      try {
+        loginBody = await loginResponse.text();
+      } catch {
+        loginBody = null;
+      }
+    }
+
+    console.log(
+      "Login response received"
+    );
+
+    /*
+      If IPS itself rejected the credentials,
+      stop here and show us the actual response.
+    */
+
+    if (!loginResponse.ok()) {
+      return res.status(401).json({
+        ok: false,
+        stage: "login-api",
+        status: loginResponse.status(),
+        currentUrl: page.url(),
+        loginResponse: loginBody,
+      });
+    }
+
+    /*
+      NOW wait specifically for the portal.
+
+      Do NOT accept login.ips.lt as success.
+    */
+
+    console.log("Waiting for portal redirect");
+
     try {
       await page.waitForURL(
         (url) =>
-          url.hostname.includes("portal.ips.lt") ||
-          url.hostname.includes("login.ips.lt"),
+          url.hostname === "portal.ips.lt",
         {
           timeout: 30000,
         }
       );
-    } catch {
-      console.log("URL wait timed out, continuing...");
+    } catch (error) {
+      /*
+        Give the frontend a tiny chance to finish
+        any JS redirect.
+      */
+
+      await page.waitForTimeout(3000);
+
+      console.log(
+        "URL after waiting:",
+        page.url()
+      );
+
+      if (!page.url().includes("portal.ips.lt")) {
+        return res.status(401).json({
+          ok: false,
+          stage: "portal-redirect",
+          error:
+            "Login API returned 200 but browser did not reach portal",
+          currentUrl: page.url(),
+          loginResponse: loginBody,
+        });
+      }
     }
 
-    console.log("URL after login:", page.url());
+    console.log(
+      "Portal reached:",
+      page.url()
+    );
 
-    // Open the actual IPS measurements page
-    console.log("Opening IPS events page");
+    /*
+      Wait for portal authentication initialization.
+    */
 
     await page.goto(
       "https://portal.ips.lt/lt/events/general",
@@ -90,17 +173,27 @@ export default async function handler(req, res) {
       }
     );
 
-    console.log("Events page URL:", page.url());
+    console.log(
+      "Events page:",
+      page.url()
+    );
 
-    // Get cookies
+    await page.waitForTimeout(2000);
+
+    /*
+      Read cookies.
+    */
+
     const cookies = await context.cookies();
 
     const accessTokenCookie = cookies.find(
-      (cookie) => cookie.name === "accessToken"
+      (cookie) =>
+        cookie.name === "accessToken"
     );
 
     const refreshTokenCookie = cookies.find(
-      (cookie) => cookie.name === "refreshToken"
+      (cookie) =>
+        cookie.name === "refreshToken"
     );
 
     console.log(
@@ -113,31 +206,52 @@ export default async function handler(req, res) {
       refreshTokenCookie ? "FOUND" : "NOT FOUND"
     );
 
-    // Also inspect localStorage in case IPS stores auth there
-    let browserStorage = {};
+    /*
+      Also check localStorage/sessionStorage.
+    */
 
-    try {
-      browserStorage = await page.evaluate(() => {
-        const data = {};
+    const storage = await page.evaluate(() => {
+      const local = {};
+      const session = {};
 
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
+      for (
+        let i = 0;
+        i < localStorage.length;
+        i++
+      ) {
+        const key = localStorage.key(i);
 
-          if (key) {
-            data[key] = localStorage.getItem(key);
-          }
+        if (key) {
+          local[key] =
+            localStorage.getItem(key);
         }
+      }
 
-        return data;
-      });
-    } catch (error) {
-      console.log("Could not inspect localStorage:", error.message);
-    }
+      for (
+        let i = 0;
+        i < sessionStorage.length;
+        i++
+      ) {
+        const key = sessionStorage.key(i);
+
+        if (key) {
+          session[key] =
+            sessionStorage.getItem(key);
+        }
+      }
+
+      return {
+        local,
+        session,
+      };
+    });
 
     const accessToken =
       accessTokenCookie?.value ||
-      browserStorage.accessToken ||
-      browserStorage.token ||
+      storage.local.accessToken ||
+      storage.local.token ||
+      storage.session.accessToken ||
+      storage.session.token ||
       null;
 
     console.log(
@@ -145,15 +259,18 @@ export default async function handler(req, res) {
       accessToken ? "FOUND" : "NOT FOUND"
     );
 
-    // Fetch measurements
-    const items = 500;
+    /*
+      Fetch measurements.
+    */
 
     const apiUrl =
-      `https://portal.ips.lt/api/measurements/latest?items=${items}`;
+      "https://portal.ips.lt/api/measurements/latest?items=500";
 
     const headers = {
-      Accept: "application/json, text/plain, */*",
-      Referer: "https://portal.ips.lt/lt/events/general",
+      Accept:
+        "application/json, text/plain, */*",
+      Referer:
+        "https://portal.ips.lt/lt/events/general",
     };
 
     if (accessToken) {
@@ -161,38 +278,59 @@ export default async function handler(req, res) {
         `Bearer ${accessToken}`;
     }
 
-    console.log("Fetching measurements");
-
-    const response = await context.request.get(
-      apiUrl,
-      {
-        headers,
-        timeout: 30000,
-      }
+    console.log(
+      "Fetching measurements"
     );
 
+    const response =
+      await context.request.get(
+        apiUrl,
+        {
+          headers,
+          timeout: 30000,
+        }
+      );
+
     console.log(
-      "Measurements API status:",
+      "Measurements status:",
       response.status()
     );
 
     if (!response.ok()) {
-      const responseText = await response.text();
+      const body =
+        await response.text();
 
-      return res.status(response.status()).json({
-        ok: false,
-        stage: "measurements",
-        status: response.status(),
-        accessTokenFound: Boolean(accessToken),
-        refreshTokenFound: Boolean(
-          refreshTokenCookie?.value
-        ),
-        currentUrl: page.url(),
-        error: responseText,
-      });
+      return res
+        .status(response.status())
+        .json({
+          ok: false,
+          stage: "measurements",
+          status:
+            response.status(),
+
+          currentUrl:
+            page.url(),
+
+          accessTokenFound:
+            Boolean(accessToken),
+
+          refreshTokenFound:
+            Boolean(
+              refreshTokenCookie?.value
+            ),
+
+          localStorageKeys:
+            Object.keys(storage.local),
+
+          sessionStorageKeys:
+            Object.keys(storage.session),
+
+          error: body,
+        });
     }
 
-    const measurements = await response.json();
+    const measurements =
+      await response.json();
 
     console.log(
       `Received ${measurements.length} measurements`
@@ -205,19 +343,24 @@ export default async function handler(req, res) {
           item.measurement?.id ?? null,
 
         dateTime:
-          item.measurement?.dateTime ?? null,
+          item.measurement?.dateTime ??
+          null,
 
         result:
-          item.measurement?.result ?? null,
+          item.measurement?.result ??
+          null,
 
         employeeNumber:
-          item.employee?.employeeNumber ?? null,
+          item.employee
+            ?.employeeNumber ?? null,
 
         name:
-          item.employee?.name?.trim() ?? null,
+          item.employee?.name?.trim() ??
+          null,
 
         surname:
-          item.employee?.surname?.trim() ?? null,
+          item.employee?.surname?.trim() ??
+          null,
 
         deviceSerial:
           item.deviceSerial ?? null,
@@ -234,30 +377,38 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      count: measurements.length,
-      accessTokenFound: Boolean(accessToken),
-      refreshTokenFound: Boolean(
-        refreshTokenCookie?.value
-      ),
+
+      count:
+        measurements.length,
+
+      accessTokenFound:
+        Boolean(accessToken),
+
+      refreshTokenFound:
+        Boolean(
+          refreshTokenCookie?.value
+        ),
+
       preview,
     });
   } catch (error) {
-    console.error("IPS sync error");
-    console.error(error);
+    console.error(
+      "IPS sync error:",
+      error
+    );
 
     return res.status(500).json({
       ok: false,
+      stage: "exception",
       error:
         error?.message ||
-        "Unknown IPS sync error",
+        "Unknown IPS error",
     });
   } finally {
     if (browser) {
       try {
         await browser.close();
-      } catch {
-        // ignore browser close errors
-      }
+      } catch {}
     }
   }
 }
