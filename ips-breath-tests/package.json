@@ -1,0 +1,9 @@
+{
+  "name": "ips-breath-tests",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@sparticuz/chromium": "latest",
+    "playwright-core": "latest"
+  }
+}
