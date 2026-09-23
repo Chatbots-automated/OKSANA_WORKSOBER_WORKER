@@ -4,6 +4,7 @@
   "type": "module",
   "dependencies": {
     "@sparticuz/chromium": "latest",
+    "@supabase/supabase-js": "latest",
     "playwright-core": "latest"
   }
 }
