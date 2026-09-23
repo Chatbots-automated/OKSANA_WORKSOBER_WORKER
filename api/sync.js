@@ -1,24 +1,31 @@
 import chromium from "@sparticuz/chromium";
 import { chromium as playwright } from "playwright-core";
-import { createClient } from "@supabase/supabase-js";
-
-const MAX_SHIFT_HOURS = Number(
-  process.env.MAX_SHIFT_HOURS || 16
-);
-
-const SHIFT_REBUILD_HOURS = Number(
-  process.env.SHIFT_REBUILD_HOURS || 72
-);
 
 /*
-  IPS gives us local Lithuanian timestamps like:
+  Hardcoded shift rule.
+
+  Any measurements from the same employee
+  within 16 hours from the FIRST measurement
+  are treated as one shift.
+
+  This allows overnight shifts such as:
+
+  2026-09-22 21:55
+  2026-09-23 01:10
+  2026-09-23 06:03
+
+  => one shift:
+     21:55 -> 06:03
+*/
+
+const MAX_SHIFT_HOURS = 16;
+
+/*
+  IPS gives local Lithuanian timestamps:
 
   2026-09-22 22:57:00
 
-  We store them in Supabase as timestamp without time zone.
-
-  For calculations we temporarily treat those components as UTC.
-  This keeps hour differences simple without shifting the displayed time.
+  Keep them as local clock timestamps.
 */
 
 function normalizeIpsDateTime(value) {
@@ -30,18 +37,17 @@ function normalizeIpsDateTime(value) {
     .slice(0, 19);
 }
 
-function pseudoTimestampMs(value) {
+/*
+  Used only to calculate differences between
+  timestamps without changing their displayed time.
+*/
+
+function timestampMs(value) {
   if (!value) return null;
 
   const normalized = normalizeIpsDateTime(value);
 
   return Date.parse(`${normalized}Z`);
-}
-
-function formatPseudoTimestamp(ms) {
-  return new Date(ms)
-    .toISOString()
-    .slice(0, 19);
 }
 
 function parsePromille(value) {
@@ -59,82 +65,137 @@ function parsePromille(value) {
     : parsed;
 }
 
-function chunkArray(array, size) {
-  const chunks = [];
+/*
+  Convert IPS response into clean rows
+  that n8n can upsert directly into Supabase.
+*/
 
-  for (
-    let i = 0;
-    i < array.length;
-    i += size
-  ) {
-    chunks.push(
-      array.slice(i, i + size)
-    );
-  }
+function normalizeMeasurements(measurements) {
+  return measurements
+    .filter(
+      (item) =>
+        item.measurement?.id &&
+        item.measurement?.dateTime &&
+        item.employee?.employeeNumber
+    )
+    .map((item) => ({
+      measurement_id:
+        item.measurement.id,
 
-  return chunks;
+      employee_number:
+        item.employee.employeeNumber,
+
+      employee_name:
+        item.employee?.name?.trim() ||
+        null,
+
+      employee_surname:
+        item.employee?.surname?.trim() ||
+        null,
+
+      measured_at:
+        normalizeIpsDateTime(
+          item.measurement.dateTime
+        ),
+
+      result_text:
+        item.measurement?.result ||
+        null,
+
+      result_promille:
+        parsePromille(
+          item.measurement?.result
+        ),
+
+      device_serial:
+        item.deviceSerial ||
+        null,
+
+      company_object:
+        item.companyObject ||
+        null,
+
+      subdivision:
+        item.subdivision ||
+        null,
+
+      is_violation:
+        item.isViolation ?? false,
+
+      is_access_control_event:
+        item.isAccessControlEvent ?? false,
+
+      latitude:
+        item.measurement?.latitude ??
+        null,
+
+      longitude:
+        item.measurement?.longitude ??
+        null,
+
+      measurement_photo:
+        item.measurement?.measurementPhoto ||
+        null,
+    }));
 }
 
 /*
-  Build shifts for each employee.
+  Build work shifts from the measurements.
 
-  Rule:
+  Measurements are grouped by employee.
 
-  First measurement starts a shift.
+  The FIRST measurement starts a shift.
 
-  Any later measurement for that employee that happens
-  within MAX_SHIFT_HOURS from the FIRST measurement
-  belongs to the same shift.
+  Every next measurement within 16 hours
+  from that FIRST measurement stays in
+  the same shift.
 
-  Example:
-
-  2026-09-22 21:55
-  2026-09-23 01:10
-  2026-09-23 06:03
-
-  becomes:
-
-  21:55 -> 06:03
-
-  This supports overnight shifts.
+  Earliest = work start
+  Latest   = work end
 */
 
 function buildShifts(measurements) {
-  const employees = new Map();
+  const employeeGroups = new Map();
 
-  for (const row of measurements) {
+  /*
+    Group by employee number.
+  */
+
+  for (const measurement of measurements) {
     if (
-      !row.employee_number ||
-      !row.measured_at
+      !measurement.employee_number ||
+      !measurement.measured_at
     ) {
       continue;
     }
 
     const key = String(
-      row.employee_number
+      measurement.employee_number
     );
 
-    if (!employees.has(key)) {
-      employees.set(key, []);
+    if (!employeeGroups.has(key)) {
+      employeeGroups.set(key, []);
     }
 
-    employees.get(key).push(row);
+    employeeGroups
+      .get(key)
+      .push(measurement);
   }
 
   const shifts = [];
 
+  /*
+    Process each employee separately.
+  */
+
   for (
     const [, employeeMeasurements]
-    of employees
+    of employeeGroups
   ) {
     employeeMeasurements.sort(
       (a, b) =>
-        pseudoTimestampMs(
-          a.measured_at
-        ) -
-        pseudoTimestampMs(
-          b.measured_at
-        )
+        timestampMs(a.measured_at) -
+        timestampMs(b.measured_at)
     );
 
     let currentShift = null;
@@ -143,16 +204,21 @@ function buildShifts(measurements) {
       const measurement
       of employeeMeasurements
     ) {
-      const measurementMs =
-        pseudoTimestampMs(
+      const measurementTime =
+        timestampMs(
           measurement.measured_at
         );
 
       if (
-        measurementMs === null
+        measurementTime === null
       ) {
         continue;
       }
+
+      /*
+        No current shift:
+        this measurement starts one.
+      */
 
       if (!currentShift) {
         currentShift = {
@@ -178,6 +244,8 @@ function buildShifts(measurements) {
 
           worked_minutes: null,
 
+          worked_hours: null,
+
           start_measurement_id:
             measurement.measurement_id,
 
@@ -186,23 +254,20 @@ function buildShifts(measurements) {
           test_count: 1,
 
           status: "single_test",
-
-          updated_at:
-            new Date().toISOString(),
         };
 
         continue;
       }
 
-      const startMs =
-        pseudoTimestampMs(
+      const shiftStartTime =
+        timestampMs(
           currentShift.shift_start
         );
 
       const hoursFromStart =
         (
-          measurementMs -
-          startMs
+          measurementTime -
+          shiftStartTime
         ) /
         1000 /
         60 /
@@ -214,9 +279,18 @@ function buildShifts(measurements) {
 
       if (
         hoursFromStart >= 0 &&
-        hoursFromStart <=
-          MAX_SHIFT_HOURS
+        hoursFromStart <= MAX_SHIFT_HOURS
       ) {
+        const workedMinutes =
+          Math.round(
+            (
+              measurementTime -
+              shiftStartTime
+            ) /
+              1000 /
+              60
+          );
+
         currentShift.shift_end =
           measurement.measured_at;
 
@@ -226,17 +300,21 @@ function buildShifts(measurements) {
         currentShift.test_count += 1;
 
         currentShift.worked_minutes =
-          Math.round(
+          workedMinutes;
+
+        currentShift.worked_hours =
+          Number(
             (
-              measurementMs -
-              startMs
-            ) /
-              1000 /
-              60
+              workedMinutes / 60
+            ).toFixed(2)
           );
 
         currentShift.status =
           "paired";
+
+        /*
+          Keep latest known name.
+        */
 
         currentShift.employee_name =
           measurement.employee_name ||
@@ -250,9 +328,12 @@ function buildShifts(measurements) {
       }
 
       /*
-        Measurement is outside current shift window.
+        More than 16 hours since start.
 
-        Save current shift and start another.
+        Previous shift is finished.
+
+        Current measurement starts
+        a new shift.
       */
 
       shifts.push(currentShift);
@@ -280,6 +361,8 @@ function buildShifts(measurements) {
 
         worked_minutes: null,
 
+        worked_hours: null,
+
         start_measurement_id:
           measurement.measurement_id,
 
@@ -288,112 +371,49 @@ function buildShifts(measurements) {
         test_count: 1,
 
         status: "single_test",
-
-        updated_at:
-          new Date().toISOString(),
       };
     }
+
+    /*
+      Don't forget employee's final shift.
+    */
 
     if (currentShift) {
       shifts.push(currentShift);
     }
   }
 
-  shifts.sort(
+  /*
+    Stable unique key for n8n / Supabase upsert.
+
+    Example:
+
+    6_2026-09-22T22:57:00
+
+    If another measurement comes later,
+    shift_start remains the same,
+    therefore n8n updates the same row.
+  */
+
+  const finalShifts =
+    shifts.map((shift) => ({
+      shift_key:
+        `${shift.employee_number}_${shift.shift_start}`,
+
+      ...shift,
+    }));
+
+  /*
+    Newest shifts first.
+  */
+
+  finalShifts.sort(
     (a, b) =>
-      pseudoTimestampMs(
-        a.shift_start
-      ) -
-      pseudoTimestampMs(
-        b.shift_start
-      )
+      timestampMs(b.shift_start) -
+      timestampMs(a.shift_start)
   );
 
-  return shifts;
-}
-
-async function getRecentMeasurements(
-  supabase,
-  since
-) {
-  const allRows = [];
-
-  const pageSize = 1000;
-
-  let from = 0;
-
-  while (true) {
-    const to =
-      from + pageSize - 1;
-
-    const {
-      data,
-      error,
-    } =
-      await supabase
-        .from(
-          "ips_measurements"
-        )
-        .select(
-          `
-          measurement_id,
-          employee_number,
-          employee_name,
-          employee_surname,
-          measured_at
-          `
-        )
-        .gte(
-          "measured_at",
-          since
-        )
-        .order(
-          "measured_at",
-          {
-            ascending: true,
-          }
-        )
-        .range(
-          from,
-          to
-        );
-
-    if (error) {
-      throw new Error(
-        `Could not load recent measurements: ${error.message}`
-      );
-    }
-
-    if (
-      !data ||
-      data.length === 0
-    ) {
-      break;
-    }
-
-    allRows.push(...data);
-
-    if (
-      data.length <
-      pageSize
-    ) {
-      break;
-    }
-
-    from += pageSize;
-
-    /*
-      Safety limit.
-      We should never realistically need
-      anywhere near this many for 72 hours.
-    */
-
-    if (from >= 10000) {
-      break;
-    }
-  }
-
-  return allRows;
+  return finalShifts;
 }
 
 export default async function handler(
@@ -404,33 +424,19 @@ export default async function handler(
 
   try {
     /*
-      ENV
+      Only IPS credentials required.
     */
 
-    const required = [
-      "IPS_EMAIL",
-      "IPS_PASSWORD",
-      "SUPABASE_URL",
-      "SUPABASE_SERVICE_ROLE_KEY",
-    ];
-
-    const missing =
-      required.filter(
-        (key) =>
-          !process.env[key]
-      );
-
-    if (missing.length) {
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          stage: "env",
-          error:
-            `Missing environment variables: ${missing.join(
-              ", "
-            )}`,
-        });
+    if (
+      !process.env.IPS_EMAIL ||
+      !process.env.IPS_PASSWORD
+    ) {
+      return res.status(500).json({
+        ok: false,
+        stage: "env",
+        error:
+          "Missing IPS_EMAIL or IPS_PASSWORD",
+      });
     }
 
     console.log(
@@ -438,27 +444,7 @@ export default async function handler(
     );
 
     /*
-      SUPABASE
-    */
-
-    const supabase =
-      createClient(
-        process.env
-          .SUPABASE_URL,
-
-        process.env
-          .SUPABASE_SERVICE_ROLE_KEY,
-
-        {
-          auth: {
-            persistSession: false,
-            autoRefreshToken: false,
-          },
-        }
-      );
-
-    /*
-      CHROMIUM
+      Launch Chromium.
     */
 
     browser =
@@ -520,6 +506,10 @@ export default async function handler(
       timeout: 15000,
     });
 
+    console.log(
+      "Filling credentials"
+    );
+
     await emailInput.fill(
       process.env.IPS_EMAIL
     );
@@ -528,9 +518,9 @@ export default async function handler(
       process.env.IPS_PASSWORD
     );
 
-    console.log(
-      "Submitting login"
-    );
+    /*
+      Wait specifically for the login API call.
+    */
 
     const loginResponsePromise =
       page.waitForResponse(
@@ -548,6 +538,10 @@ export default async function handler(
         }
       );
 
+    console.log(
+      "Submitting login"
+    );
+
     await submitButton.click();
 
     const loginResponse =
@@ -558,9 +552,7 @@ export default async function handler(
       loginResponse.status()
     );
 
-    if (
-      !loginResponse.ok()
-    ) {
+    if (!loginResponse.ok()) {
       let body = null;
 
       try {
@@ -572,16 +564,19 @@ export default async function handler(
         .status(401)
         .json({
           ok: false,
+
           stage:
             "login-api",
+
           status:
             loginResponse.status(),
+
           error: body,
         });
     }
 
     /*
-      WAIT FOR PORTAL
+      Wait for real portal redirect.
     */
 
     console.log(
@@ -629,7 +624,8 @@ export default async function handler(
     );
 
     /*
-      EVENTS PAGE
+      Open events page to initialise
+      portal authentication.
     */
 
     await page.goto(
@@ -647,7 +643,7 @@ export default async function handler(
     );
 
     /*
-      ACCESS TOKEN
+      Find IPS access token.
     */
 
     const cookies =
@@ -668,59 +664,53 @@ export default async function handler(
       );
 
     const storage =
-      await page.evaluate(
-        () => {
-          const local = {};
-          const session = {};
+      await page.evaluate(() => {
+        const local = {};
+        const session = {};
 
-          for (
-            let i = 0;
-            i <
-            localStorage.length;
-            i++
-          ) {
-            const key =
-              localStorage.key(i);
+        for (
+          let i = 0;
+          i < localStorage.length;
+          i++
+        ) {
+          const key =
+            localStorage.key(i);
 
-            if (key) {
-              local[key] =
-                localStorage.getItem(
-                  key
-                );
-            }
+          if (key) {
+            local[key] =
+              localStorage.getItem(
+                key
+              );
           }
-
-          for (
-            let i = 0;
-            i <
-            sessionStorage.length;
-            i++
-          ) {
-            const key =
-              sessionStorage.key(i);
-
-            if (key) {
-              session[key] =
-                sessionStorage.getItem(
-                  key
-                );
-            }
-          }
-
-          return {
-            local,
-            session,
-          };
         }
-      );
+
+        for (
+          let i = 0;
+          i < sessionStorage.length;
+          i++
+        ) {
+          const key =
+            sessionStorage.key(i);
+
+          if (key) {
+            session[key] =
+              sessionStorage.getItem(
+                key
+              );
+          }
+        }
+
+        return {
+          local,
+          session,
+        };
+      });
 
     const accessToken =
       accessTokenCookie?.value ||
-      storage.local
-        .accessToken ||
+      storage.local.accessToken ||
       storage.local.token ||
-      storage.session
-        .accessToken ||
+      storage.session.accessToken ||
       storage.session.token ||
       null;
 
@@ -743,7 +733,7 @@ export default async function handler(
     );
 
     /*
-      FETCH LATEST 500
+      Get latest 500 measurements.
     */
 
     const apiUrl =
@@ -798,250 +788,34 @@ export default async function handler(
         });
     }
 
-    const measurements =
+    const ipsMeasurements =
       await response.json();
 
     console.log(
-      `Received ${measurements.length} measurements`
+      `Received ${ipsMeasurements.length} IPS measurements`
     );
 
     /*
-      NORMALIZE
+      Normalize all 500.
     */
 
-    const rows =
-      measurements
-        .filter(
-          (item) =>
-            item.measurement
-              ?.id &&
-            item.measurement
-              ?.dateTime &&
-            item.employee
-              ?.employeeNumber
-        )
-        .map(
-          (item) => ({
-            measurement_id:
-              item.measurement.id,
-
-            employee_number:
-              item.employee
-                .employeeNumber,
-
-            employee_name:
-              item.employee
-                ?.name
-                ?.trim() ||
-              null,
-
-            employee_surname:
-              item.employee
-                ?.surname
-                ?.trim() ||
-              null,
-
-            measured_at:
-              normalizeIpsDateTime(
-                item.measurement
-                  .dateTime
-              ),
-
-            result_text:
-              item.measurement
-                ?.result ||
-              null,
-
-            result_promille:
-              parsePromille(
-                item.measurement
-                  ?.result
-              ),
-
-            device_serial:
-              item.deviceSerial ||
-              null,
-
-            company_object:
-              item.companyObject ||
-              null,
-
-            subdivision:
-              item.subdivision ||
-              null,
-
-            is_violation:
-              item.isViolation ??
-              false,
-
-            is_access_control_event:
-              item
-                .isAccessControlEvent ??
-              false,
-
-            latitude:
-              item.measurement
-                ?.latitude ??
-              null,
-
-            longitude:
-              item.measurement
-                ?.longitude ??
-              null,
-
-            measurement_photo:
-              item.measurement
-                ?.measurementPhoto ||
-              null,
-
-            synced_at:
-              new Date().toISOString(),
-          })
-        );
-
-    console.log(
-      `Normalized ${rows.length} measurements`
-    );
-
-    /*
-      SAVE RAW MEASUREMENTS
-
-      We upsert by measurement_id.
-
-      Therefore the same measurement
-      can be downloaded every 10 minutes
-      without creating duplicates.
-    */
-
-    const rawChunks =
-      chunkArray(
-        rows,
-        250
-      );
-
-    for (
-      const chunk
-      of rawChunks
-    ) {
-      const {
-        error,
-      } =
-        await supabase
-          .from(
-            "ips_measurements"
-          )
-          .upsert(
-            chunk,
-            {
-              onConflict:
-                "measurement_id",
-            }
-          );
-
-      if (error) {
-        throw new Error(
-          `Supabase raw measurement upsert failed: ${error.message}`
-        );
-      }
-    }
-
-    console.log(
-      `${rows.length} raw measurements saved`
-    );
-
-    /*
-      FIND NEWEST IPS TIME
-    */
-
-    let newestMs = null;
-
-    for (const row of rows) {
-      const ms =
-        pseudoTimestampMs(
-          row.measured_at
-        );
-
-      if (
-        ms !== null &&
-        (
-          newestMs === null ||
-          ms > newestMs
-        )
-      ) {
-        newestMs = ms;
-      }
-    }
-
-    if (
-      newestMs === null
-    ) {
-      return res
-        .status(200)
-        .json({
-          ok: true,
-
-          fetched:
-            measurements.length,
-
-          saved:
-            rows.length,
-
-          shiftsBuilt: 0,
-
-          message:
-            "No usable timestamps found",
-        });
-    }
-
-    /*
-      REBUILD RECENT SHIFTS
-
-      Default = last 72 hours.
-
-      That's comfortably larger
-      than our default 16-hour
-      maximum shift.
-    */
-
-    const rebuildSinceMs =
-      newestMs -
-      SHIFT_REBUILD_HOURS *
-        60 *
-        60 *
-        1000;
-
-    const rebuildSince =
-      formatPseudoTimestamp(
-        rebuildSinceMs
+    const measurements =
+      normalizeMeasurements(
+        ipsMeasurements
       );
 
     console.log(
-      "Rebuilding shifts since:",
-      rebuildSince
+      `Normalized ${measurements.length} measurements`
     );
 
     /*
-      Load raw data from Supabase,
-      not just this one IPS request.
-
-      This is important because an
-      overnight shift may have started
-      during a previous sync.
+      Build work shifts directly
+      from those measurements.
     */
-
-    const recentMeasurements =
-      await getRecentMeasurements(
-        supabase,
-        rebuildSince
-      );
-
-    console.log(
-      `Loaded ${recentMeasurements.length} recent raw measurements`
-    );
 
     const shifts =
       buildShifts(
-        recentMeasurements
+        measurements
       );
 
     console.log(
@@ -1049,138 +823,13 @@ export default async function handler(
     );
 
     /*
-      Delete calculated shifts from
-      the recent rebuild window.
+      Return EVERYTHING to n8n.
 
-      Raw measurements are NEVER deleted.
-
-      Then we recreate the derived shifts
-      from the source data.
+      n8n handles:
+      - raw measurement upsert
+      - shift upsert
+      - Supabase
     */
-
-    const {
-      error:
-        deleteShiftError,
-    } =
-      await supabase
-        .from(
-          "ips_work_shifts"
-        )
-        .delete()
-        .gte(
-          "shift_start",
-          rebuildSince
-        );
-
-    if (
-      deleteShiftError
-    ) {
-      throw new Error(
-        `Could not clear recent shifts: ${deleteShiftError.message}`
-      );
-    }
-
-    /*
-      INSERT REBUILT SHIFTS
-    */
-
-    const shiftChunks =
-      chunkArray(
-        shifts,
-        250
-      );
-
-    for (
-      const chunk
-      of shiftChunks
-    ) {
-      if (
-        chunk.length === 0
-      ) {
-        continue;
-      }
-
-      const {
-        error,
-      } =
-        await supabase
-          .from(
-            "ips_work_shifts"
-          )
-          .insert(chunk);
-
-      if (error) {
-        throw new Error(
-          `Shift insert failed: ${error.message}`
-        );
-      }
-    }
-
-    /*
-      CURRENT / RECENT SHIFT PREVIEW
-    */
-
-    const recentShiftPreview =
-      [...shifts]
-        .sort(
-          (a, b) =>
-            pseudoTimestampMs(
-              b.shift_start
-            ) -
-            pseudoTimestampMs(
-              a.shift_start
-            )
-        )
-        .slice(0, 20)
-        .map(
-          (shift) => ({
-            employeeNumber:
-              shift.employee_number,
-
-            employee:
-              [
-                shift.employee_name,
-                shift.employee_surname,
-              ]
-                .filter(Boolean)
-                .join(" "),
-
-            shiftDate:
-              shift.shift_date,
-
-            start:
-              shift.shift_start,
-
-            end:
-              shift.shift_end,
-
-            workedMinutes:
-              shift.worked_minutes,
-
-            workedHours:
-              shift.worked_minutes !==
-              null
-                ? Number(
-                    (
-                      shift.worked_minutes /
-                      60
-                    ).toFixed(
-                      2
-                    )
-                  )
-                : null,
-
-            testCount:
-              shift.test_count,
-
-            status:
-              shift.status,
-          })
-        );
-
-    console.log(
-      "IPS sync complete"
-    );
 
     return res
       .status(200)
@@ -1188,22 +837,15 @@ export default async function handler(
         ok: true,
 
         ipsFetched:
+          ipsMeasurements.length,
+
+        measurementCount:
           measurements.length,
 
-        rawSaved:
-          rows.length,
-
-        shiftRebuildHours:
-          SHIFT_REBUILD_HOURS,
-
-        maxShiftHours:
-          MAX_SHIFT_HOURS,
-
-        recentMeasurementsUsed:
-          recentMeasurements.length,
-
-        shiftsBuilt:
+        shiftCount:
           shifts.length,
+
+        maxShiftHours: 16,
 
         accessTokenFound:
           Boolean(
@@ -1212,12 +854,12 @@ export default async function handler(
 
         refreshTokenFound:
           Boolean(
-            refreshTokenCookie
-              ?.value
+            refreshTokenCookie?.value
           ),
 
-        recentShifts:
-          recentShiftPreview,
+        measurements,
+
+        shifts,
       });
   } catch (error) {
     console.error(
